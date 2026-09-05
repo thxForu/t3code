@@ -1,0 +1,162 @@
+name: Phone APK
+
+# Keeps the `phone` branch on top of upstream main and publishes a side-loadable
+# Android preview APK as a GitHub release. Obtainium on the phone follows releases.
+# Merge conflicts are resolved by headless Claude Code driven by GLM through the
+# Z.ai Anthropic-compatible endpoint. If that fails, the run fails and an issue is opened.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even when upstream has no new commits"
+        type: boolean
+        default: false
+
+concurrency:
+  group: phone-apk
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/pingdotgg/t3code.git
+  APP_VARIANT: preview
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: phone
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "phone-apk bot"
+          git config user.email "phone-apk@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing new upstream."
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U | tee conflicts.txt
+          fi
+
+      - name: Resolve conflicts with GLM
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.GLM_API_KEY }}
+          ANTHROPIC_DEFAULT_OPUS_MODEL: glm-5.3
+          ANTHROPIC_DEFAULT_SONNET_MODEL: glm-5.3
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: glm-5.3-flash
+          CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1"
+          API_TIMEOUT_MS: "3000000"
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude -p --model glm-5.3 --dangerously-skip-permissions --max-turns 60 \
+            "You are resolving a git merge of upstream/main into the branch 'phone' of the t3code repository.
+             The 'phone' branch carries small local changes on top of upstream; upstream is the source of truth for everything else.
+             Conflicted files: $(tr '\n' ' ' < conflicts.txt)
+             For each file: read both sides, keep upstream behavior and preserve the intent of the local change.
+             Remove every conflict marker. Do not run the build. Do not commit. Stop when 'git diff --check' is clean and 'git diff --name-only --diff-filter=U' is empty."
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "Conflicts remain after the agent run." >&2
+            exit 1
+          fi
+          if git grep -n -E '^(<<<<<<<|=======|>>>>>>>)( |$)' -- . ':!*.md'; then
+            echo "Conflict markers remain." >&2
+            exit 1
+          fi
+          git add -A
+          git commit --no-edit
+
+      - name: Setup Vite+
+        if: steps.merge.outputs.changed == 'true'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+
+      - name: Expose pnpm
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          echo "$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin" >> "$GITHUB_PATH"
+
+      - name: Typecheck mobile
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: apps/mobile
+        run: pnpm typecheck
+
+      - uses: actions/setup-java@v4
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prebuild Android
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: apps/mobile
+        env:
+          EXPO_NO_GIT_STATUS: "1"
+          CI: "1"
+        run: |
+          cp ../../.env.example ../../.env
+          pnpm exec expo prebuild --clean --platform android --no-install
+          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' android/gradle.properties
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > android/app/phone.keystore
+          # Release builds from prebuild sign with the debug config; point that config at our key.
+          sed -i "s|storeFile file('debug.keystore')|storeFile file('phone.keystore')|; s|storePassword 'android'|storePassword '${{ secrets.ANDROID_KEYSTORE_PASSWORD }}'|; s|keyAlias 'androiddebugkey'|keyAlias 'phone'|; s|keyPassword 'android'|keyPassword '${{ secrets.ANDROID_KEYSTORE_PASSWORD }}'|" android/app/build.gradle
+          grep -n -E "storeFile|keyAlias|versionCode" android/app/build.gradle
+
+      - name: Build APK
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: apps/mobile/android
+        env:
+          CI: "1"
+        run: ./gradlew assembleRelease --no-daemon -q
+
+      - name: Push merged branch
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin phone
+
+      - name: Release
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse --short upstream/main)"
+          tag="phone-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          cp apps/mobile/android/app/build/outputs/apk/release/app-release.apk "t3code-preview-$tag.apk"
+          gh release create "$tag" "t3code-preview-$tag.apk" \
+            --title "T3 Code Preview $tag" \
+            --notes "Built from upstream main $sha merged into phone. Package com.t3tools.t3code.preview, arm64-v8a."
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Phone APK build failed: run ${{ github.run_number }}" \
+            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
