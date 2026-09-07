@@ -165,3 +165,13 @@ Full glossary with file links: `docs/internals/glossary.md`
 
 - Don't verify with browsers or computer use unless the user explicitly agrees or requests it.
 - Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
+
+## Phone fork (thxForu/t3code, branch `phone`)
+
+This checkout is a fork used to side-load the Android preview app on the owner's Xiaomi Mi 9T. Read this before touching `apps/mobile` here.
+
+- `phone` = upstream `main` + the owner's local patches. Keep patches small and isolated; upstream is merged in on every build and wins everywhere else.
+- Build and publish: `FORCE=1 bash C:/projects/t3code-build-phone.sh` (git-bash). It merges upstream, runs `expo prebuild`, signs with `C:/projects/t3code-phone.keystore` (alias `phone`), copies the APK to `C:/projects/t3code-preview.apk`, and uploads it to claw at `https://apk.31-187-64-35.sslip.io/latest.apk`, where Obtainium on the phone picks it up. Task Scheduler runs the same script hourly and it self-limits to one build per 3 days.
+- Windows build pitfalls the script already handles; do not undo them: `sdk.dir` with forward slashes, `cmake.dir` pointing at cmake 3.31.6 (3.22.1 loops ninja on pnpm paths), Node 24 pinned in `nodeExecutableAndArgs` (Node 26 crashes at exit), no `NODE_OPTIONS`, `reactNativeArchitectures=arm64-v8a`.
+- `.github/workflows/phone-apk.yml` is the same pipeline for GitHub Actions; it stays idle while the account is billing-locked.
+- Merge conflict during a build: resolve it by hand on `phone`, keep upstream behavior, then rerun the script. Never rebase `phone`.
