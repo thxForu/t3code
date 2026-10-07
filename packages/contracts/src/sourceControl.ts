@@ -5,6 +5,7 @@ import { VcsDriverKind } from "./vcs.ts";
 export const SourceControlProviderKind = Schema.Literals([
   "github",
   "gitlab",
+  "forgejo",
   "azure-devops",
   "bitbucket",
   "unknown",
@@ -122,6 +123,20 @@ export const SourceControlProviderAuth = Schema.Struct({
   account: Schema.Option(TrimmedNonEmptyString),
   host: Schema.Option(TrimmedNonEmptyString),
   detail: Schema.Option(TrimmedNonEmptyString),
+  /** Every login the provider CLI holds, across hosts. Only GitHub reports these today. */
+  accounts: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        host: TrimmedNonEmptyString,
+        account: TrimmedNonEmptyString,
+        active: Schema.Boolean,
+        authenticated: Schema.Boolean,
+        error: Schema.optionalKey(TrimmedNonEmptyString),
+        /** Set when the login comes from a token variable such as `GH_TOKEN`, which wins over Settings. */
+        environmentVariable: Schema.optionalKey(TrimmedNonEmptyString),
+      }),
+    ),
+  ),
 });
 export type SourceControlProviderAuth = typeof SourceControlProviderAuth.Type;
 
@@ -154,7 +169,7 @@ export const SourceControlDiscoveryResult = Schema.Struct({
 });
 export type SourceControlDiscoveryResult = typeof SourceControlDiscoveryResult.Type;
 
-export class SourceControlProviderError extends Schema.TaggedErrorClass<SourceControlProviderError>()(
+export class SourceControlProviderError extends Schema.TaggedError<SourceControlProviderError>()(
   "SourceControlProviderError",
   {
     provider: SourceControlProviderKind,
@@ -172,7 +187,7 @@ export class SourceControlProviderError extends Schema.TaggedErrorClass<SourceCo
   }
 }
 
-export class SourceControlRepositoryError extends Schema.TaggedErrorClass<SourceControlRepositoryError>()(
+export class SourceControlRepositoryError extends Schema.TaggedError<SourceControlRepositoryError>()(
   "SourceControlRepositoryError",
   {
     provider: SourceControlProviderKind,

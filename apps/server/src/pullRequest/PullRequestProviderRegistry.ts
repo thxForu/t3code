@@ -5,9 +5,13 @@ import type { SourceControlProviderKind } from "@t3tools/contracts";
 
 import * as AzureDevOpsCli from "../sourceControl/AzureDevOpsCli.ts";
 import * as BitbucketApi from "../sourceControl/BitbucketApi.ts";
-import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import * as GitHubApi from "../sourceControl/GitHubApi.ts";
+import * as GitHubCredentials from "../sourceControl/GitHubCredentials.ts";
 import * as GitHubGraphQlBudget from "../sourceControl/githubGraphQlBudget.ts";
+import * as SourceControlRateLimit from "../sourceControl/SourceControlRateLimit.ts";
 import * as GitLabCli from "../sourceControl/GitLabCli.ts";
+import * as ForgejoCli from "../sourceControl/ForgejoCli.ts";
+import * as ForgejoPullRequestProvider from "./ForgejoPullRequestProvider.ts";
 import * as AzureDevOpsPullRequestCli from "./AzureDevOpsPullRequestCli.ts";
 import * as AzureDevOpsPullRequestProvider from "./AzureDevOpsPullRequestProvider.ts";
 import * as BitbucketPullRequestApi from "./BitbucketPullRequestApi.ts";
@@ -41,11 +45,14 @@ export function fromProviders(
 /**
  * The hosts this build can read change requests from. A host with no entry here still shows up
  * in the provider list as unimplemented, so its projects are explained rather than missing.
+ *
+ * @public Service construction is part of the canonical Effect module API.
  */
 export const make = Effect.map(
   Effect.all([
     GitHubPullRequestProvider.make,
     GitLabPullRequestProvider.make,
+    ForgejoPullRequestProvider.make,
     BitbucketPullRequestProvider.make,
     AzureDevOpsPullRequestProvider.make,
   ]),
@@ -55,11 +62,18 @@ export const make = Effect.map(
 export const layer = Layer.effect(PullRequestProviderRegistry, make).pipe(
   Layer.provide(
     GitHubPullRequestCli.layer.pipe(
-      Layer.provide(GitHubCli.layer),
-      Layer.provide(GitHubGraphQlBudget.layer),
+      Layer.provide(
+        GitHubApi.layer.pipe(
+          Layer.provide(GitHubCredentials.layer),
+          // The same layers GitHubCli merges, so both share one budget and one pause per host.
+          Layer.provide(GitHubGraphQlBudget.layer),
+          Layer.provide(SourceControlRateLimit.layer),
+        ),
+      ),
     ),
   ),
   Layer.provide(GitLabPullRequestCli.layer.pipe(Layer.provide(GitLabCli.layer))),
+  Layer.provide(ForgejoCli.layer),
   Layer.provide(BitbucketPullRequestApi.layer.pipe(Layer.provide(BitbucketApi.layer))),
   Layer.provide(AzureDevOpsPullRequestCli.layer.pipe(Layer.provide(AzureDevOpsCli.layer))),
 );

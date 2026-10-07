@@ -12,7 +12,6 @@ import {
   isTerminalCompositionCommitInput,
   isTerminalCompositionKey,
   isTerminalCopyShortcut,
-  isTerminalLinkPointerGesture,
   isTerminalPasteShortcut,
   loadTerminalFontFamily,
   primeTerminalCopyInput,
@@ -168,14 +167,21 @@ describe("GhosttyTerminalSurface visibility", () => {
       resize() {
         for (const callback of resizeCallbacks) callback();
       },
-      pointer(type: string, clientX: number, buttons: number) {
+      pointer(
+        type: string,
+        clientX: number,
+        buttons: number,
+        modifiers: boolean | Partial<Pick<MouseEvent, "ctrlKey" | "metaKey" | "shiftKey">> = {},
+        button = 0,
+      ) {
         canvas.dispatchEvent(
           Object.assign(new Event(type, { cancelable: true }), {
             clientX,
             clientY: 5,
             pointerId: 1,
-            button: 0,
+            button,
             buttons,
+            ...(typeof modifiers === "boolean" ? { shiftKey: modifiers } : modifiers),
           }),
         );
       },
@@ -208,6 +214,113 @@ describe("GhosttyTerminalSurface visibility", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    { platform: "Linux x86_64", modifiers: { ctrlKey: true, metaKey: false } },
+    { platform: "MacIntel", modifiers: { ctrlKey: false, metaKey: true } },
+  ])(
+    "gates path links and preserves selection and URLs ($platform)",
+    async ({ platform, modifiers }) => {
+      vi.stubGlobal("navigator", { platform });
+      const harness = createHarness();
+      vi.spyOn(Event.prototype, "timeStamp", "get").mockImplementation(() => Date.now());
+      let canOpenPaths = false;
+      const openLink = vi.fn();
+      const surface = await harness.create({
+        canActivateLink: (text) => text.startsWith("https://") || canOpenPaths,
+        onLinkActivate: openLink,
+      });
+      surface.write("/repo/file.ts");
+      harness.flushFrame();
+      harness.pointer("pointermove", 5, 0, modifiers);
+      expect(surface.canvas.style.cursor).toBe("");
+      harness.pointer("pointerdown", 5, 1, modifiers);
+      harness.pointer("pointerup", 5, 0, modifiers);
+      expect(openLink).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(501);
+      harness.pointer("pointerdown", 5, 1);
+      harness.pointer("pointermove", 37, 1);
+      harness.pointer("pointerup", 37, 0);
+      expect(surface.getSelection()).toBe("/repo");
+
+      vi.advanceTimersByTime(501);
+      harness.pointer("pointermove", 5, 0, modifiers);
+      canOpenPaths = true;
+      surface.refreshLinkActivation();
+      expect(surface.canvas.style.cursor).toBe("pointer");
+      harness.pointer("pointerdown", 5, 1, modifiers);
+      harness.pointer("pointerup", 5, 0, modifiers);
+      expect(openLink).toHaveBeenCalledExactlyOnceWith("/repo/file.ts", expect.any(Event));
+
+      vi.advanceTimersByTime(501);
+      harness.pointer("pointerdown", 5, 1, modifiers);
+      canOpenPaths = false;
+      surface.refreshLinkActivation();
+      expect(surface.canvas.style.cursor).toBe("");
+      harness.pointer("pointerup", 5, 0, modifiers);
+      expect(openLink).toHaveBeenCalledOnce();
+
+      vi.advanceTimersByTime(501);
+      surface.resetAndWrite("https://t3.codes");
+      harness.flushFrame();
+      harness.pointer("pointermove", 5, 0, modifiers);
+      expect(surface.canvas.style.cursor).toBe("pointer");
+      harness.pointer("pointerdown", 5, 1, modifiers);
+      harness.pointer("pointerup", 5, 0, modifiers);
+      expect(openLink).toHaveBeenLastCalledWith("https://t3.codes", expect.any(Event));
+    },
+  );
+
+  it("resends an unchanged grid when authorization and attachment become ready", async () => {
+    const harness = createHarness();
+    let canOperate = false;
+    let attached = false;
+    const resizePty = vi.fn<(cols: number, rows: number) => void>();
+    const surface = await harness.create({
+      onResize: (cols, rows) => {
+        if (canOperate && attached) resizePty(cols, rows);
+      },
+    });
+    vi.advanceTimersByTime(150);
+    expect(resizePty).not.toHaveBeenCalled();
+
+    canOperate = true;
+    surface.resendSize();
+    vi.advanceTimersByTime(150);
+    expect(resizePty).not.toHaveBeenCalled();
+
+    attached = true;
+    surface.resendSize();
+    vi.advanceTimersByTime(150);
+    expect(resizePty).toHaveBeenCalledExactlyOnceWith(20, 6);
+    surface.fit();
+    vi.advanceTimersByTime(150);
+    expect(resizePty).toHaveBeenCalledOnce();
+
+    canOperate = false;
+    harness.mount.clientWidth = 248;
+    surface.fit();
+    vi.advanceTimersByTime(150);
+    expect(resizePty).toHaveBeenCalledOnce();
+  });
+
+  it("replays the current grid on reveal when a hidden host becomes ready", async () => {
+    const harness = createHarness();
+    const onResize = vi.fn<(cols: number, rows: number) => void>();
+    const surface = await harness.create({ onResize });
+    vi.advanceTimersByTime(150);
+    onResize.mockClear();
+
+    surface.setVisible(false);
+    surface.resendSize();
+    vi.advanceTimersByTime(150);
+    expect(onResize).not.toHaveBeenCalled();
+
+    surface.setVisible(true);
+    vi.advanceTimersByTime(150);
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(20, 6);
   });
 
   it("stops hidden snapshots and paint while preserving live VT replies and the next cursor", async () => {
@@ -278,6 +391,109 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(surface.getSelection()).toBe("");
     expect(surface.getSelectionPosition()).toBeNull();
     expect(harness.renderedSnapshot.rowData[0]?.cells.some((cell) => cell.selected)).toBe(false);
+  });
+
+  it("pastes the terminal selection, and only that, on a Linux middle click", async () => {
+    const harness = createHarness();
+    const readText = vi.fn(async () => "clipboard text");
+    vi.stubGlobal("navigator", { platform: "Linux x86_64", clipboard: { readText } });
+    const surface = await harness.create();
+    surface.write("hello world");
+    harness.flushFrame();
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointermove", 37, 1);
+    harness.pointer("pointerup", 37, 0);
+    expect(surface.getSelection()).toBe("hello");
+
+    harness.onData.mockClear();
+    harness.pointer("pointerdown", 5, 4, false, 1);
+    await vi.waitFor(() => expect(harness.onData).toHaveBeenCalled());
+    expect(harness.onData.mock.calls.at(-1)?.[0]).toBe("hello");
+    expect(surface.getSelection()).toBe("hello");
+
+    // Without a selection there is no primary buffer to paste; the clipboard
+    // holds what the user copied and must not be substituted.
+    surface.clearSelection();
+    harness.pointer("pointerdown", 5, 4, false, 1);
+    expect(readText).not.toHaveBeenCalled();
+  });
+
+  it("starts a selection when dragging from a link", async () => {
+    const harness = createHarness();
+    const onLinkActivate = vi.fn();
+    const surface = await harness.create({ onLinkActivate });
+    surface.write("https://example.com");
+    harness.flushFrame();
+
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointermove", 37, 1);
+    harness.pointer("pointerup", 37, 0);
+
+    expect(onLinkActivate).not.toHaveBeenCalled();
+    expect(surface.getSelection()).toBe("https");
+  });
+
+  it("keeps a link click active through slight pointer movement", async () => {
+    const harness = createHarness();
+    const onLinkActivate = vi.fn();
+    const surface = await harness.create({ onLinkActivate });
+    surface.write("https://example.com");
+    harness.flushFrame();
+
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointermove", 6, 1);
+    harness.pointer("pointerup", 6, 0);
+
+    expect(onLinkActivate).toHaveBeenCalledOnce();
+  });
+
+  it("uses repeated link clicks for word and line selection", async () => {
+    const harness = createHarness();
+    const onLinkActivate = vi.fn();
+    const surface = await harness.create({ onLinkActivate });
+    surface.write("https://example.com tail");
+    harness.flushFrame();
+
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointerup", 5, 0);
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointerup", 5, 0);
+    expect(onLinkActivate).toHaveBeenCalledOnce();
+    expect(surface.getSelection()).not.toBe("");
+
+    harness.pointer("pointerdown", 5, 1);
+    harness.pointer("pointerup", 5, 0);
+    expect(onLinkActivate).toHaveBeenCalledOnce();
+    expect(surface.getSelection()).toBe("https://example.com tail");
+  });
+
+  it("uses Shift drags over links for selection", async () => {
+    const harness = createHarness();
+    const onLinkActivate = vi.fn();
+    const surface = await harness.create({ onLinkActivate });
+    surface.write("https://example.com");
+    harness.flushFrame();
+
+    harness.pointer("pointerdown", 5, 1, true);
+    harness.pointer("pointermove", 37, 1, true);
+    harness.pointer("pointerup", 37, 0, true);
+    expect(onLinkActivate).not.toHaveBeenCalled();
+    expect(surface.getSelection()).toBe("https");
+  });
+
+  it("does not activate a link replaced before pointer release", async () => {
+    const harness = createHarness();
+    const onLinkActivate = vi.fn();
+    const surface = await harness.create({ onLinkActivate });
+    surface.write("https://first.example");
+    harness.flushFrame();
+
+    harness.pointer("pointerdown", 5, 1);
+    surface.write("\x1b[2J\x1b[Hhttps://second.example");
+    harness.flushFrame();
+    harness.pointer("pointerup", 5, 0);
+
+    expect(onLinkActivate).not.toHaveBeenCalled();
   });
 
   it("stops zero-size mounts and repaints when the same size returns", async () => {
@@ -555,6 +771,20 @@ describe("isTerminalCopyShortcut", () => {
   it("uses the produced character instead of the physical key position", () => {
     expect(isTerminalCopyShortcut(event({ key: "C", metaKey: true }), "MacIntel")).toBe(true);
     expect(isTerminalCopyShortcut(event({ key: "j", metaKey: true }), "MacIntel")).toBe(false);
+  });
+
+  it("supports the conventional Ctrl+Insert copy shortcut", () => {
+    expect(isTerminalCopyShortcut(event({ key: "Insert", ctrlKey: true }), "Linux x86_64")).toBe(
+      true,
+    );
+    expect(isTerminalCopyShortcut(event({ key: "Insert" }), "Linux x86_64")).toBe(false);
+    expect(
+      isTerminalCopyShortcut(
+        event({ key: "Insert", ctrlKey: true, shiftKey: true }),
+        "Linux x86_64",
+      ),
+    ).toBe(false);
+    expect(isTerminalCopyShortcut(event({ key: "Insert", ctrlKey: true }), "MacIntel")).toBe(false);
   });
 });
 
@@ -873,19 +1103,6 @@ describe("terminalWheelArrowData", () => {
     expect(terminalWheelArrowData(3, false)).toBe("\u001b[B\u001b[B\u001b[B");
     expect(terminalWheelArrowData(-1, true)).toBe("\u001bOA");
     expect(terminalWheelArrowData(0, true)).toBe("");
-  });
-});
-
-describe("isTerminalLinkPointerGesture", () => {
-  it("uses Command on macOS and Control elsewhere", () => {
-    expect(isTerminalLinkPointerGesture({ ctrlKey: false, metaKey: true }, "MacIntel")).toBe(true);
-    expect(isTerminalLinkPointerGesture({ ctrlKey: true, metaKey: false }, "MacIntel")).toBe(false);
-    expect(isTerminalLinkPointerGesture({ ctrlKey: true, metaKey: false }, "Linux x86_64")).toBe(
-      true,
-    );
-    expect(isTerminalLinkPointerGesture({ ctrlKey: false, metaKey: true }, "Linux x86_64")).toBe(
-      false,
-    );
   });
 });
 
